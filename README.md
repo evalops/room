@@ -31,6 +31,14 @@ ROOM_ADDR=:8788 ROOM_SERVER_URL=http://localhost:8787 go run ./cmd/room-mcp
 
 Register the MCP endpoint with your agent as `http://localhost:8788/mcp`.
 
+Smoke-test the MCP endpoint with a real MCP client:
+
+```bash
+go run ./cmd/room-mcp-call \
+  -endpoint http://localhost:8788/mcp \
+  -plan "Add a customer endpoint that queries projects from the database."
+```
+
 ## Hook runner
 
 `roomctl` reads hook JSON on stdin and evaluates it against the active Room
