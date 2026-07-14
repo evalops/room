@@ -35,7 +35,7 @@ bundled generic hook templates cannot manufacture that identity and therefore
 do not advertise MCP governance. This explicit boundary prevents an
 unclassified pre-tool event from being mislabeled as verified MCP traffic.
 
-A pre-tool payload may include a `room_mcp_invocation` object with the typed
+A `pre-mcp` payload must include a `room_mcp_invocation` object with the typed
 fields `provider_tool_id`, `server_id`, `tool_name`, `transport`, and `endpoint`.
 Room ignores caller-supplied provider and assurance values: those come from the
 credential's `--hook-provider` or `--mcp-proxy` capability. Provider/tool
