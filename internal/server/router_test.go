@@ -66,6 +66,53 @@ func TestDashboardRuleLifecycleAPI(t *testing.T) {
 	}
 }
 
+func TestDashboardSupportsNonMutatingPolicyControlDeepLinks(t *testing.T) {
+	ruleStore, err := store.Open(filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer ruleStore.Close()
+	httpServer := httptest.NewServer(New(app.New(ruleStore), WithLocalAuth()))
+	defer httpServer.Close()
+
+	resp, err := http.Get(httpServer.URL + "/")
+	if err != nil {
+		t.Fatalf("get dashboard: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read dashboard: %v", err)
+	}
+	html := string(body)
+	for _, contract := range []string{"location.hash", "applyPolicyControlDeepLink", "expected_candidate_updated_at", "expectedCandidateUpdatedAt", "is stale", "server CAS can reject the stale action", "Opening this link did not change policy", `state.selected = { kind: "candidate", id: candidate.id }`, `state.tab = "rollout"`} {
+		if !strings.Contains(html, contract) {
+			t.Fatalf("dashboard missing deep-link contract %q", contract)
+		}
+	}
+	start := strings.Index(html, "function applyPolicyControlDeepLink")
+	end := strings.Index(html[start:], "async function refreshCandidates")
+	if start < 0 || end < 0 {
+		t.Fatal("could not isolate policy-control deep-link handler")
+	}
+	handler := html[start : start+end]
+	if strings.Contains(handler, "transitionCandidate(") || strings.Contains(handler, "requestTransition(") || strings.Contains(handler, "showModal(") {
+		t.Fatal("deep-link handler must not trigger a policy mutation or approval dialog")
+	}
+	if strings.Count(handler, "state.policyControlDeepLink = null") < 2 {
+		t.Fatal("deep-link handler must clear stale state when the candidate fragment is absent or unknown")
+	}
+	transitionStart := strings.Index(html, "function requestTransition")
+	transitionEnd := strings.Index(html[transitionStart:], "async function transitionCandidate")
+	if transitionStart < 0 || transitionEnd < 0 {
+		t.Fatal("could not isolate policy transition request builder")
+	}
+	transitionBuilder := html[transitionStart : transitionStart+transitionEnd]
+	if !strings.Contains(transitionBuilder, "state.policyControlDeepLink?.candidateID === candidate.id") || !strings.Contains(transitionBuilder, "expectedUpdatedAt: offered") {
+		t.Fatal("deep-linked transition must retain the audited offered candidate revision")
+	}
+}
+
 func TestReviewIntelligenceLifecycleAPI(t *testing.T) {
 	ruleStore, err := store.Open(filepath.Join(t.TempDir(), "room.db"))
 	if err != nil {
@@ -277,8 +324,8 @@ func TestLocalAuthMiddlewareUsesDeclaredRouteRole(t *testing.T) {
 		role auth.Role
 		want auth.Principal
 	}{
-		{name: "admin", role: auth.RoleAdmin, want: auth.Principal{ID: "local-admin", Role: auth.RoleAdmin, HumanOperator: true}},
-		{name: "agent", role: auth.RoleAgent, want: auth.Principal{ID: "local-agent", Role: auth.RoleAgent, Scope: auth.Scope{WorkspaceID: "local", Repository: "local", AgentID: "local-agent"}}},
+		{name: "admin", role: auth.RoleAdmin, want: auth.Principal{ID: "local-admin", Role: auth.RoleAdmin, HumanOperator: true, LocalAuth: true}},
+		{name: "agent", role: auth.RoleAgent, want: auth.Principal{ID: "local-agent", Role: auth.RoleAgent, LocalAuth: true, Scope: auth.Scope{WorkspaceID: "local", Repository: "local", AgentID: "local-agent"}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	roomv1 "github.com/haasonsaas/room/gen/go/room/v1"
@@ -13,6 +14,8 @@ import (
 	"github.com/haasonsaas/room/internal/compliance"
 	"github.com/haasonsaas/room/internal/intelligence"
 	"github.com/haasonsaas/room/internal/store"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestAgentIdentityOverridesForgedEvaluationScope(t *testing.T) {
@@ -53,6 +56,241 @@ func TestAgentIdentityOverridesForgedEvaluationScope(t *testing.T) {
 	event := audit.Msg.GetEvents()[0]
 	if event.GetWorkspaceId() != "trusted-workspace" || event.GetRepository() != "trusted-repo" || event.GetAgentType() != "codex-1" {
 		t.Fatalf("audit used caller scope: %+v", event)
+	}
+}
+
+func TestRecordMcpElicitationBindsAuditToAuthenticatedAgent(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer database.Close()
+	service := New(database)
+	principal := auth.Principal{ID: "trusted-agent", Role: auth.RoleAgent, Scope: auth.Scope{WorkspaceID: "trusted-workspace", Repository: "trusted-repo", AgentID: "codex-1"}}
+	ctx := auth.WithPrincipal(context.Background(), principal)
+	evaluationAuditID, err := database.AppendAudit(&roomv1.AuditEvent{Kind: roomv1.AuditEventKind_AUDIT_EVENT_KIND_EVALUATION, SubjectId: principal.ID, WorkspaceId: principal.Scope.WorkspaceID, Repository: principal.Scope.Repository, AgentType: principal.Scope.AgentID, EvaluationId: "evaluation-1", Decision: roomv1.Decision_DECISION_NEEDS_CHANGES, McpElicitationEligible: true})
+	if err != nil {
+		t.Fatalf("append evaluation audit: %v", err)
+	}
+	receipt := &roomv1.McpElicitationReceipt{
+		Id: "elicitation-1", EvaluationId: "evaluation-1", EvaluationAuditEventId: evaluationAuditID,
+		Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_FORM, Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION,
+		Action:     roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_OFFERED,
+		OccurredAt: timestamppb.Now(),
+	}
+	offerResponse, err := service.RecordMcpElicitation(ctx, connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: receipt}))
+	if err != nil {
+		t.Fatalf("record elicitation offer: %v", err)
+	}
+	final := proto.Clone(receipt).(*roomv1.McpElicitationReceipt)
+	final.Action = roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_ACCEPT
+	final.Resolution = roomv1.McpResolutionAction_MCP_RESOLUTION_ACTION_RUN_REQUIRED_CHECKS
+	if _, err := service.RecordMcpElicitation(ctx, connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: final})); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("terminal receipt without offer code = %s, want invalid argument", connect.CodeOf(err))
+	}
+	forged := proto.Clone(final).(*roomv1.McpElicitationReceipt)
+	forged.OfferAuditEventId = evaluationAuditID
+	if _, err := service.RecordMcpElicitation(ctx, connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: forged})); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("terminal receipt with forged offer code = %s, want permission denied", connect.CodeOf(err))
+	}
+	final.OfferAuditEventId = offerResponse.Msg.GetAuditEventId()
+	response, err := service.RecordMcpElicitation(ctx, connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: final}))
+	if err != nil || response.Msg.GetAuditEventId() == "" {
+		t.Fatalf("record bound terminal elicitation: response %+v, err %v", response, err)
+	}
+	events, err := database.ListAudit(10, roomv1.AuditEventKind_AUDIT_EVENT_KIND_MCP_ELICITATION)
+	if err != nil || len(events) != 2 {
+		t.Fatalf("elicitation audits = %d, err %v", len(events), err)
+	}
+	event := events[0]
+	if event.GetSubjectId() != principal.ID || event.GetWorkspaceId() != principal.Scope.WorkspaceID || event.GetRepository() != principal.Scope.Repository || event.GetAgentType() != principal.Scope.AgentID {
+		t.Fatalf("audit scope = %+v", event)
+	}
+	if event.GetMcpElicitation().GetId() != receipt.GetId() || event.GetMcpElicitation().GetOfferAuditEventId() != offerResponse.Msg.GetAuditEventId() {
+		t.Fatalf("audit receipt = %+v", event.GetMcpElicitation())
+	}
+}
+
+func TestRecordMcpElicitationRequiresServerProvenEvaluationEligibility(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	service := New(database)
+	principal := auth.Principal{ID: "agent", Role: auth.RoleAgent, Scope: auth.Scope{WorkspaceID: "workspace", Repository: "repo", AgentID: "codex"}}
+	ctx := auth.WithPrincipal(context.Background(), principal)
+	tests := []struct {
+		name     string
+		result   *roomv1.EvaluationResult
+		wantCode connect.Code
+	}{
+		{name: "allow with trigger-like typed fields", result: &roomv1.EvaluationResult{EvaluationId: "allow-evaluation", Decision: roomv1.Decision_DECISION_ALLOW, RequiredChecks: []string{"required check"}}, wantCode: connect.CodeFailedPrecondition},
+		{name: "blocking without typed next step", result: &roomv1.EvaluationResult{EvaluationId: "triggerless-evaluation", Decision: roomv1.Decision_DECISION_DENY}, wantCode: connect.CodeFailedPrecondition},
+		{name: "eligible blocking", result: &roomv1.EvaluationResult{EvaluationId: "eligible-evaluation", Decision: roomv1.Decision_DECISION_NEEDS_CHANGES, Matches: []*roomv1.RuleMatch{{RequiredEvidence: []string{"test receipt"}}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event := evaluationEvent(principal, roomv1.AnalysisPhase_ANALYSIS_PHASE_PLAN, test.result)
+			auditID, err := database.AppendAudit(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := &roomv1.McpElicitationReceipt{
+				Id: test.name, EvaluationId: test.result.GetEvaluationId(), EvaluationAuditEventId: auditID,
+				Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_FORM, Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION,
+				Action: roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_OFFERED,
+			}
+			response, err := service.RecordMcpElicitation(ctx, connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: receipt}))
+			if test.wantCode != 0 {
+				if connect.CodeOf(err) != test.wantCode {
+					t.Fatalf("code = %s, want %s", connect.CodeOf(err), test.wantCode)
+				}
+				return
+			}
+			if err != nil || response.Msg.GetAuditEventId() == "" {
+				t.Fatalf("eligible receipt response = %+v, err %v", response, err)
+			}
+		})
+	}
+}
+
+func TestRecordMcpElicitationRejectsEvaluationFromAnotherAgentScope(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer database.Close()
+	evaluationAuditID, err := database.AppendAudit(&roomv1.AuditEvent{Kind: roomv1.AuditEventKind_AUDIT_EVENT_KIND_EVALUATION, SubjectId: "other-agent", WorkspaceId: "workspace", Repository: "repo", AgentType: "codex-2", EvaluationId: "evaluation-1"})
+	if err != nil {
+		t.Fatalf("append evaluation audit: %v", err)
+	}
+	service := New(database)
+	principal := auth.Principal{ID: "trusted-agent", Role: auth.RoleAgent, Scope: auth.Scope{WorkspaceID: "workspace", Repository: "repo", AgentID: "codex-1"}}
+	receipt := &roomv1.McpElicitationReceipt{Id: "elicitation-1", EvaluationId: "evaluation-1", EvaluationAuditEventId: evaluationAuditID, Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_FORM, Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION, Action: roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_UNSUPPORTED}
+	_, err = service.RecordMcpElicitation(auth.WithPrincipal(context.Background(), principal), connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: receipt}))
+	if connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("cross-scope receipt code = %s, want permission denied", connect.CodeOf(err))
+	}
+}
+
+func TestRecordMcpPolicyControlElicitationRequiresCurrentScopedCandidate(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer database.Close()
+	now := timestamppb.Now()
+	candidate := &roomv1.PolicyCandidate{Id: "candidate-1", ClaimKind: roomv1.ReviewClaimKind_REVIEW_CLAIM_KIND_STATE_TRANSITION, ArtifactKind: roomv1.PolicyArtifactKind_POLICY_ARTIFACT_KIND_DETERMINISTIC_CHECK, ProposedRule: &roomv1.Rule{Id: "rule-1", Title: "Typed transition", Severity: roomv1.Severity_SEVERITY_HIGH, Scope: &roomv1.RuleScope{Repositories: []string{"repo"}}, RequiredEvidence: []string{"receipt"}, Remediation: []string{"persist"}, Owner: "reviewer", Triggers: []*roomv1.SignalSelector{{Signal: roomv1.SignalKind_SIGNAL_KIND_REVIEW_STATE_TRANSITION, Phases: []roomv1.AnalysisPhase{roomv1.AnalysisPhase_ANALYSIS_PHASE_PLAN}, MinimumConfidenceBasisPoints: 9000}}, RequiredCoverage: []roomv1.SignalKind{roomv1.SignalKind_SIGNAL_KIND_REVIEW_STATE_TRANSITION}, CreatedAt: now, UpdatedAt: now}, SourceFindingIds: []string{"finding-1"}, Metrics: &roomv1.PolicyMetrics{SupportCount: 1}, RolloutStage: roomv1.RolloutStage_ROLLOUT_STAGE_DRAFT, MinimumConfidenceBasisPoints: 9000, CreatedBy: "reviewer", CreatedAt: now, UpdatedAt: now}
+	stored, err := database.UpsertPolicyCandidate(candidate)
+	if err != nil {
+		t.Fatalf("seed candidate: %v", err)
+	}
+	service := New(database)
+	receipt := &roomv1.McpElicitationReceipt{Id: "elicitation-1", PolicyCandidateId: candidate.GetId(), Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_URL, Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL, Action: roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_OFFERED, TargetRolloutStage: roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK, ExpectedCandidateUpdatedAt: stored.GetUpdatedAt()}
+	principal := auth.Principal{ID: "agent", Role: auth.RoleAgent, Scope: auth.Scope{WorkspaceID: "workspace", Repository: "other-repo", AgentID: "codex"}}
+	_, err = service.RecordMcpElicitation(auth.WithPrincipal(context.Background(), principal), connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: receipt}))
+	if connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("cross-repository policy handoff code = %s, want permission denied", connect.CodeOf(err))
+	}
+	localPrincipal := auth.Principal{ID: "local-agent", Role: auth.RoleAgent, LocalAuth: true, Scope: auth.Scope{WorkspaceID: "local", Repository: "local", AgentID: "local-agent"}}
+	localResponse, err := service.RecordMcpElicitation(auth.WithPrincipal(context.Background(), localPrincipal), connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: receipt}))
+	if err != nil || localResponse.Msg.GetAuditEventId() == "" {
+		t.Fatalf("record auth-disabled cross-repository handoff: response %+v, err %v", localResponse, err)
+	}
+	principal.Scope.Repository = "repo"
+	stale := proto.Clone(receipt).(*roomv1.McpElicitationReceipt)
+	stale.ExpectedCandidateUpdatedAt = timestamppb.New(stored.GetUpdatedAt().AsTime().Add(-time.Second))
+	_, err = service.RecordMcpElicitation(auth.WithPrincipal(context.Background(), principal), connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: stale}))
+	if connect.CodeOf(err) != connect.CodeAborted {
+		t.Fatalf("stale policy handoff code = %s, want aborted", connect.CodeOf(err))
+	}
+	response, err := service.RecordMcpElicitation(auth.WithPrincipal(context.Background(), principal), connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: receipt}))
+	if err != nil || response.Msg.GetAuditEventId() == "" {
+		t.Fatalf("record current policy handoff: response %+v, err %v", response, err)
+	}
+	updated := proto.Clone(stored).(*roomv1.PolicyCandidate)
+	updated.UpdatedAt = nil
+	updated.MinimumConfidenceBasisPoints = 8500
+	for _, trigger := range updated.GetProposedRule().GetTriggers() {
+		trigger.MinimumConfidenceBasisPoints = 8500
+	}
+	if _, err := database.UpsertPolicyCandidate(updated); err != nil {
+		t.Fatalf("update candidate after offer: %v", err)
+	}
+	final := proto.Clone(receipt).(*roomv1.McpElicitationReceipt)
+	final.Action = roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_ACCEPT
+	final.OfferAuditEventId = response.Msg.GetAuditEventId()
+	finalResponse, err := service.RecordMcpElicitation(auth.WithPrincipal(context.Background(), principal), connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: final}))
+	if err != nil || finalResponse.Msg.GetAuditEventId() == "" {
+		t.Fatalf("record final handoff after candidate update: response %+v, err %v", finalResponse, err)
+	}
+	finalAudit, err := database.AuditEvent(finalResponse.Msg.GetAuditEventId())
+	if err != nil || finalAudit.GetMcpElicitation().GetOfferAuditEventId() != response.Msg.GetAuditEventId() {
+		t.Fatalf("final audit offer binding = %+v, err %v", finalAudit.GetMcpElicitation(), err)
+	}
+	forged := proto.Clone(final).(*roomv1.McpElicitationReceipt)
+	forged.ExpectedCandidateUpdatedAt = timestamppb.New(final.GetExpectedCandidateUpdatedAt().AsTime().Add(time.Nanosecond))
+	if _, err := service.RecordMcpElicitation(auth.WithPrincipal(context.Background(), principal), connect.NewRequest(&roomv1.RecordMcpElicitationRequest{Receipt: forged})); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("forged offer binding code = %s, want permission denied", connect.CodeOf(err))
+	}
+	audits, err := database.ListAudit(10, roomv1.AuditEventKind_AUDIT_EVENT_KIND_MCP_ELICITATION)
+	if err != nil {
+		t.Fatalf("list policy handoff audits: %v", err)
+	}
+	foundCandidateAudit := false
+	for _, audit := range audits {
+		if audit.GetPolicyCandidateId() == candidate.GetId() {
+			foundCandidateAudit = true
+			break
+		}
+	}
+	if !foundCandidateAudit {
+		t.Fatalf("policy handoff audit not discoverable by candidate %q: %+v", candidate.GetId(), audits)
+	}
+	unchanged, err := database.PolicyCandidate(candidate.GetId())
+	if err != nil || unchanged.GetRolloutStage() != roomv1.RolloutStage_ROLLOUT_STAGE_DRAFT {
+		t.Fatalf("policy handoff mutated candidate: stage %v, err %v", unchanged.GetRolloutStage(), err)
+	}
+}
+
+func TestValidateMcpElicitationReceiptRejectsPurposeModeMismatch(t *testing.T) {
+	for _, receipt := range []*roomv1.McpElicitationReceipt{
+		{Id: "form-as-url", EvaluationId: "evaluation-1", EvaluationAuditEventId: "audit-1", Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_URL, Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION, Action: roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_DECLINE},
+		{Id: "url-as-form", PolicyCandidateId: "candidate-1", Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_FORM, Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL, Action: roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_DECLINE, TargetRolloutStage: roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK},
+	} {
+		if err := validateMcpElicitationReceipt(receipt); err == nil {
+			t.Fatalf("accepted purpose/mode mismatch: %+v", receipt)
+		}
+	}
+}
+
+func TestValidateMcpElicitationReceiptEnforcesClosedResolutionContract(t *testing.T) {
+	valid := &roomv1.McpElicitationReceipt{
+		Id: "elicitation", EvaluationId: "evaluation", EvaluationAuditEventId: "evaluation-audit",
+		Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_FORM, Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION,
+		Action: roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_ACCEPT, Resolution: roomv1.McpResolutionAction_MCP_RESOLUTION_ACTION_REVISE, OfferAuditEventId: "offer-audit",
+	}
+	if err := validateMcpElicitationReceipt(valid); err != nil {
+		t.Fatalf("valid accepted evaluation resolution rejected: %v", err)
+	}
+	unknown := proto.Clone(valid).(*roomv1.McpElicitationReceipt)
+	unknown.Resolution = roomv1.McpResolutionAction(999)
+	if err := validateMcpElicitationReceipt(unknown); err == nil {
+		t.Fatal("unknown numeric resolution was accepted")
+	}
+	nonAccept := proto.Clone(valid).(*roomv1.McpElicitationReceipt)
+	nonAccept.Action = roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_DECLINE
+	if err := validateMcpElicitationReceipt(nonAccept); err == nil {
+		t.Fatal("resolution on declined receipt was accepted")
+	}
+	policy := &roomv1.McpElicitationReceipt{
+		Id: "policy", PolicyCandidateId: "candidate", Mode: roomv1.McpElicitationMode_MCP_ELICITATION_MODE_URL,
+		Purpose: roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL, Action: roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_OFFERED,
+		Resolution: roomv1.McpResolutionAction_MCP_RESOLUTION_ACTION_OPEN_CONTROL_PLANE, TargetRolloutStage: roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK,
+	}
+	if err := validateMcpElicitationReceipt(policy); err == nil {
+		t.Fatal("resolution on policy control receipt was accepted")
 	}
 }
 
@@ -102,6 +340,11 @@ func TestProtectedOrgPolicyRequiresHumanApprovalToBlock(t *testing.T) {
 	}
 	if err := validateRolloutTransition(candidate, roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK, true, replay); err != nil {
 		t.Fatalf("approved transition rejected: %v", err)
+	}
+	candidate.ProtectedOrgPolicy = false
+	replay.PolicyCandidateSha256, _ = intelligence.CandidateDigest(candidate)
+	if err := validateRolloutTransition(candidate, roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK, false, replay); err == nil {
+		t.Fatal("repository-scoped policy advanced to blocking without human approval")
 	}
 	if err := validateRolloutTransition(candidate, roomv1.RolloutStage_ROLLOUT_STAGE_SHADOW, true, replay); err == nil {
 		t.Fatal("backward non-rollback transition accepted")

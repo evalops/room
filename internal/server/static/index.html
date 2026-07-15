@@ -185,7 +185,7 @@
     </dialog>
 
     <script>
-      const state = { rules: [], candidates: [], findings: [], audit: [], mcpPolicy: null, selected: null, tab: "policy", view: "all", replayByCandidate: new Map(), pendingTransition: null };
+      const state = { rules: [], candidates: [], findings: [], audit: [], mcpPolicy: null, selected: null, tab: "policy", view: "all", replayByCandidate: new Map(), pendingTransition: null, policyControlDeepLink: null };
       const $ = id => document.getElementById(id);
       const severityNames = ["unspecified", "info", "low", "medium", "high", "critical"];
       const rolloutNames = ["unspecified", "draft", "shadow", "warn", "block", "paused", "rolled back"];
@@ -201,6 +201,10 @@
       const formatNumber = value => new Intl.NumberFormat().format(Number(value || 0));
       const formatPercent = basisPoints => `${(Number(basisPoints || 0) / 100).toFixed(1)}%`;
       const formatDate = value => value ? new Date(value).toLocaleString() : "Not recorded";
+      const timestampRevision = value => {
+        const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/.exec(String(value || ""));
+        return match ? `${match[1]}.${(match[2] || "").padEnd(9, "0")}Z` : null;
+      };
       const authFetch = (url, options = {}, role = "admin") => {
         const token = $(role === "agent" ? "agent-token" : "admin-token").value.trim();
         const headers = new Headers(options.headers || {});
@@ -394,7 +398,8 @@
         await task("Tune policy", async () => { await postJSON(`/api/policy-candidates/${encodeURIComponent(id)}/tune`, { expectedUpdatedAt: candidate?.updatedAt }); await refreshCandidates(); renderInspector(); });
       }
       function requestTransition(candidate, stage, humanOnly) {
-        state.pendingTransition = { candidateId: candidate.id, stage, expectedUpdatedAt: candidate.updatedAt };
+        const offered = state.policyControlDeepLink?.candidateID === candidate.id ? state.policyControlDeepLink.expectedCandidateUpdatedAt : candidate.updatedAt;
+        state.pendingTransition = { candidateId: candidate.id, stage, expectedUpdatedAt: offered };
         if (!humanOnly) { transitionCandidate(false); return; }
         $("protected-copy").textContent = `Transition ${candidate.id} from ${rolloutNames[candidate.rolloutStage]} to ${rolloutNames[stage]}. This protected control records explicit human approval.`;
         $("approval-phrase").value = ""; $("protected-confirm").disabled = true; $("protected-dialog").showModal();
@@ -403,6 +408,30 @@
         const pending = state.pendingTransition;
         if (!pending) return;
         await task("Transition policy", async () => { await postJSON(`/api/policy-candidates/${encodeURIComponent(pending.candidateId)}/transition`, { targetStage: pending.stage, humanApproved, expectedUpdatedAt: pending.expectedUpdatedAt }); await refreshCandidates(); renderInspector(); });
+      }
+      function applyPolicyControlDeepLink() {
+        const params = new URLSearchParams(location.hash.startsWith("#") ? location.hash.slice(1) : location.hash);
+        const candidateID = params.get("candidate");
+        if (!candidateID) { state.policyControlDeepLink = null; return; }
+        const candidate = state.candidates.find(item => item.id === candidateID);
+        if (!candidate) { state.policyControlDeepLink = null; setStatus(`Policy control candidate ${candidateID} was not found`, true); return; }
+        const target = params.get("target");
+        const allowedTargets = new Set(["block", "paused", "rolled_back"]);
+        const expectedCandidateUpdatedAt = params.get("expected_candidate_updated_at");
+        const expectedRevision = timestampRevision(expectedCandidateUpdatedAt);
+        const loadedRevision = timestampRevision(candidate.updatedAt);
+        state.policyControlDeepLink = { candidateID: candidate.id, target: allowedTargets.has(target) ? target : null, expectedCandidateUpdatedAt: expectedRevision ? expectedCandidateUpdatedAt : null };
+        state.selected = { kind: "candidate", id: candidate.id };
+        state.tab = "rollout";
+        renderCatalog(); renderInspector();
+        const targetCopy = state.policyControlDeepLink.target ? ` Review the requested ${state.policyControlDeepLink.target.replace("_", " ")} transition.` : "";
+        if (!expectedRevision) {
+          setStatus(`Policy control link for ${candidate.id} is missing a valid audited candidate revision. Opening this link did not change policy.`, true);
+        } else if (expectedRevision !== loadedRevision) {
+          setStatus(`Policy control link for ${candidate.id} is stale: the audited candidate revision differs from the loaded candidate. Any transition will retain the offered revision so server CAS can reject the stale action. Opening this link did not change policy.`, true);
+        } else {
+          setStatus(`Policy control opened for ${candidate.id}.${targetCopy} Opening this link did not change policy.`);
+        }
       }
       async function refreshCandidates() { const data = await apiJSON("/api/policy-candidates"); state.candidates = data.candidates || []; updateSummary(); renderCatalog(); }
       async function refresh() {
@@ -419,6 +448,7 @@
         $("connection").textContent = failures.length ? `${requests.length - failures.length}/${requests.length} sources connected` : "Connected";
         updateSummary(); renderCatalog(); renderInspector();
         if (failures.length) setStatus(failures.map(item => item.reason.message).join(" · "), true); else setStatus("Control plane refreshed");
+        applyPolicyControlDeepLink();
       }
 
       document.querySelectorAll("[data-view]").forEach(button => button.onclick = () => { state.view = button.dataset.view; document.querySelectorAll("[data-view]").forEach(item => item.classList.toggle("active", item === button)); renderCatalog(); });
@@ -452,6 +482,7 @@
       $("publish").onclick = async () => { await task("Publish ruleset", async () => { const data = await postJSON("/api/publish"); $("active-summary").textContent = `Active v${data.ruleset?.version || "?"} · ${(data.ruleset?.hash || "").slice(0, 10)}`; await refresh(); }); };
       $("approval-phrase").addEventListener("input", () => { $("protected-confirm").disabled = $("approval-phrase").value !== "APPROVE"; });
       $("protected-form").addEventListener("submit", event => { if (event.submitter?.value === "confirm") transitionCandidate(); });
+      refresh();
     </script>
   </body>
 </html>

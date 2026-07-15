@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -239,6 +240,190 @@ func (s *Service) EvaluateMcpInvocation(ctx context.Context, req *connect.Reques
 		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("persist MCP audit: %w", auditErr))
 	}
 	return connect.NewResponse(&roomv1.EvaluateMcpInvocationResponse{Decision: decision, AuditEventId: eventID}), nil
+}
+
+func (s *Service) RecordMcpElicitation(ctx context.Context, req *connect.Request[roomv1.RecordMcpElicitationRequest]) (*connect.Response[roomv1.RecordMcpElicitationResponse], error) {
+	principal, err := principalForRole(ctx, auth.RoleAgent)
+	if err != nil {
+		return nil, err
+	}
+	receipt := req.Msg.GetReceipt()
+	if err := validateMcpElicitationReceipt(receipt); err != nil {
+		return nil, connect.NewError(connect.CodeInvalidArgument, err)
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION {
+		evaluationAudit, lookupErr := s.store.AuditEvent(receipt.GetEvaluationAuditEventId())
+		if lookupErr != nil {
+			return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("load evaluation audit: %w", lookupErr))
+		}
+		if evaluationAudit == nil || evaluationAudit.GetKind() != roomv1.AuditEventKind_AUDIT_EVENT_KIND_EVALUATION || evaluationAudit.GetEvaluationId() != receipt.GetEvaluationId() || !auditScopeMatchesPrincipal(evaluationAudit, principal) {
+			return nil, connect.NewError(connect.CodePermissionDenied, errors.New("evaluation audit is not bound to the authenticated agent scope"))
+		}
+		if !blockingEvaluationDecision(evaluationAudit.GetDecision()) || !evaluationAudit.GetMcpElicitationEligible() {
+			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("evaluation is not eligible for MCP resolution elicitation"))
+		}
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL {
+		if !terminalMcpElicitationAction(receipt.GetAction()) {
+			candidate, lookupErr := s.store.PolicyCandidate(receipt.GetPolicyCandidateId())
+			if lookupErr != nil {
+				return nil, connect.NewError(connect.CodeInternal, lookupErr)
+			}
+			if candidate == nil {
+				return nil, connect.NewError(connect.CodeNotFound, errors.New("policy candidate not found"))
+			}
+			repository, repositoryErr := candidateRepository(candidate)
+			if repositoryErr != nil {
+				return nil, connect.NewError(connect.CodeFailedPrecondition, repositoryErr)
+			}
+			localUnscopedPrincipal := principal.LocalAuth || (principal.Role == auth.RoleAdmin && principal.HumanOperator && principal.Scope.Repository == "")
+			if repository != principal.Scope.Repository && !localUnscopedPrincipal {
+				return nil, connect.NewError(connect.CodePermissionDenied, errors.New("policy candidate is outside the authenticated repository scope"))
+			}
+			if receipt.GetExpectedCandidateUpdatedAt() == nil || !proto.Equal(receipt.GetExpectedCandidateUpdatedAt(), candidate.GetUpdatedAt()) {
+				return nil, connect.NewError(connect.CodeAborted, errors.New("policy candidate changed; refresh before opening human controls"))
+			}
+		}
+	}
+	if terminalMcpElicitationAction(receipt.GetAction()) {
+		offerAudit, lookupErr := s.store.AuditEvent(receipt.GetOfferAuditEventId())
+		if lookupErr != nil {
+			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("load MCP elicitation offer audit: %w", lookupErr))
+		}
+		if !elicitationOfferMatchesReceipt(offerAudit, receipt, principal) {
+			return nil, connect.NewError(connect.CodePermissionDenied, errors.New("MCP elicitation receipt is not bound to its authenticated offer"))
+		}
+	}
+	receipt = proto.Clone(receipt).(*roomv1.McpElicitationReceipt)
+	receipt.OccurredAt = timestamppb.Now()
+	event := &roomv1.AuditEvent{
+		Kind: roomv1.AuditEventKind_AUDIT_EVENT_KIND_MCP_ELICITATION, OccurredAt: timestamppb.Now(),
+		SubjectId: principal.ID, WorkspaceId: principal.Scope.WorkspaceID, Repository: principal.Scope.Repository, AgentType: principal.Scope.AgentID,
+		PolicyCandidateId: receipt.GetPolicyCandidateId(), EvidenceRecordId: receipt.GetId(), McpElicitation: receipt,
+	}
+	eventID, err := s.store.AppendAudit(event)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("persist MCP elicitation audit: %w", err))
+	}
+	return connect.NewResponse(&roomv1.RecordMcpElicitationResponse{AuditEventId: eventID}), nil
+}
+
+func validateMcpElicitationReceipt(receipt *roomv1.McpElicitationReceipt) error {
+	if receipt == nil || strings.TrimSpace(receipt.GetId()) == "" {
+		return errors.New("MCP elicitation id is required")
+	}
+	if receipt.GetMode() == roomv1.McpElicitationMode_MCP_ELICITATION_MODE_UNSPECIFIED || roomv1.McpElicitationMode_name[int32(receipt.GetMode())] == "" {
+		return errors.New("MCP elicitation mode is required")
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_UNSPECIFIED || roomv1.McpElicitationPurpose_name[int32(receipt.GetPurpose())] == "" {
+		return errors.New("MCP elicitation purpose is required")
+	}
+	if receipt.GetAction() == roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_UNSPECIFIED || roomv1.McpElicitationAction_name[int32(receipt.GetAction())] == "" {
+		return errors.New("MCP elicitation action is required")
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION && strings.TrimSpace(receipt.GetEvaluationId()) == "" {
+		return errors.New("evaluation resolution elicitation requires an evaluation id")
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION && receipt.GetMode() != roomv1.McpElicitationMode_MCP_ELICITATION_MODE_FORM {
+		return errors.New("evaluation resolution elicitation requires form mode")
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION && strings.TrimSpace(receipt.GetEvaluationAuditEventId()) == "" {
+		return errors.New("evaluation resolution elicitation requires an evaluation audit event id")
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL && strings.TrimSpace(receipt.GetPolicyCandidateId()) == "" {
+		return errors.New("policy control elicitation requires a policy candidate id")
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL && receipt.GetMode() != roomv1.McpElicitationMode_MCP_ELICITATION_MODE_URL {
+		return errors.New("policy control elicitation requires URL mode")
+	}
+	if receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL {
+		switch receipt.GetTargetRolloutStage() {
+		case roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK, roomv1.RolloutStage_ROLLOUT_STAGE_PAUSED, roomv1.RolloutStage_ROLLOUT_STAGE_ROLLED_BACK:
+		default:
+			return errors.New("policy control elicitation target must be block, paused, or rolled back")
+		}
+	}
+	if _, ok := roomv1.McpResolutionAction_name[int32(receipt.GetResolution())]; !ok {
+		return errors.New("MCP elicitation resolution is invalid")
+	}
+	acceptedEvaluationResolution := receipt.GetAction() == roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_ACCEPT && receipt.GetPurpose() == roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION
+	if acceptedEvaluationResolution && receipt.GetResolution() == roomv1.McpResolutionAction_MCP_RESOLUTION_ACTION_UNSPECIFIED {
+		return errors.New("accepted evaluation resolution requires a typed resolution")
+	}
+	if !acceptedEvaluationResolution && receipt.GetResolution() != roomv1.McpResolutionAction_MCP_RESOLUTION_ACTION_UNSPECIFIED {
+		return errors.New("typed resolution is only permitted on accepted evaluation resolution receipts")
+	}
+	if terminalMcpElicitationAction(receipt.GetAction()) && strings.TrimSpace(receipt.GetOfferAuditEventId()) == "" {
+		return errors.New("terminal MCP elicitation requires an offer audit event id")
+	}
+	if !terminalMcpElicitationAction(receipt.GetAction()) && strings.TrimSpace(receipt.GetOfferAuditEventId()) != "" {
+		return errors.New("pre-handoff MCP elicitation must not reference an offer audit event")
+	}
+	return nil
+}
+
+func terminalMcpElicitationAction(action roomv1.McpElicitationAction) bool {
+	switch action {
+	case roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_ACCEPT,
+		roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_DECLINE,
+		roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_CANCEL,
+		roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_ERROR:
+		return true
+	default:
+		return false
+	}
+}
+
+func elicitationOfferMatchesReceipt(event *roomv1.AuditEvent, receipt *roomv1.McpElicitationReceipt, principal auth.Principal) bool {
+	if event == nil || event.GetKind() != roomv1.AuditEventKind_AUDIT_EVENT_KIND_MCP_ELICITATION || !auditScopeMatchesPrincipal(event, principal) {
+		return false
+	}
+	offer := event.GetMcpElicitation()
+	if offer == nil ||
+		offer.GetAction() != roomv1.McpElicitationAction_MCP_ELICITATION_ACTION_OFFERED ||
+		offer.GetId() != receipt.GetId() ||
+		offer.GetPurpose() != receipt.GetPurpose() ||
+		offer.GetMode() != receipt.GetMode() {
+		return false
+	}
+	switch receipt.GetPurpose() {
+	case roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_EVALUATION_RESOLUTION:
+		return offer.GetEvaluationId() == receipt.GetEvaluationId() && offer.GetEvaluationAuditEventId() == receipt.GetEvaluationAuditEventId()
+	case roomv1.McpElicitationPurpose_MCP_ELICITATION_PURPOSE_POLICY_CONTROL:
+		return offer.GetPolicyCandidateId() == receipt.GetPolicyCandidateId() &&
+			offer.GetTargetRolloutStage() == receipt.GetTargetRolloutStage() &&
+			proto.Equal(offer.GetExpectedCandidateUpdatedAt(), receipt.GetExpectedCandidateUpdatedAt())
+	default:
+		return false
+	}
+}
+
+func auditScopeMatchesPrincipal(event *roomv1.AuditEvent, principal auth.Principal) bool {
+	return event.GetSubjectId() == principal.ID && event.GetWorkspaceId() == principal.Scope.WorkspaceID && event.GetRepository() == principal.Scope.Repository && event.GetAgentType() == principal.Scope.AgentID
+}
+
+func blockingEvaluationDecision(decision roomv1.Decision) bool {
+	switch decision {
+	case roomv1.Decision_DECISION_DENY, roomv1.Decision_DECISION_NEEDS_CHANGES, roomv1.Decision_DECISION_INDETERMINATE:
+		return true
+	default:
+		return false
+	}
+}
+
+func mcpElicitationEligible(result *roomv1.EvaluationResult) bool {
+	if result == nil || !blockingEvaluationDecision(result.GetDecision()) {
+		return false
+	}
+	if len(result.GetRequiredChecks()) > 0 || len(result.GetGaps()) > 0 {
+		return true
+	}
+	for _, match := range result.GetMatches() {
+		if len(match.GetRequiredEvidence()) > 0 || len(match.GetRemediation()) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) ReportEvaluation(ctx context.Context, req *connect.Request[roomv1.ReportEvaluationRequest]) (*connect.Response[roomv1.ReportEvaluationResponse], error) {
@@ -555,8 +740,8 @@ func validateRolloutTransition(candidate *roomv1.PolicyCandidate, target roomv1.
 	if target == roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK && (metrics.GetPrecisionBasisPoints() < 9500 || metrics.GetRecallBasisPoints() < 8000 || metrics.GetFalsePositiveCount() != 0) {
 		return fmt.Errorf("block rollout requires at least 95%% precision, 80%% recall, and zero false positives")
 	}
-	if target == roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK && candidate.GetProtectedOrgPolicy() && !humanAuthorized {
-		return fmt.Errorf("a human-operator credential and explicit confirmation are required for protected org-wide blocking policies")
+	if target == roomv1.RolloutStage_ROLLOUT_STAGE_BLOCK && !humanAuthorized {
+		return fmt.Errorf("a human-operator credential and explicit confirmation are required for blocking policies")
 	}
 	return nil
 }
@@ -679,7 +864,7 @@ func scopedRuleset(source *roomv1.RulesetVersion, principal auth.Principal) *roo
 }
 
 func evaluationEvent(principal auth.Principal, phase roomv1.AnalysisPhase, result *roomv1.EvaluationResult) *roomv1.AuditEvent {
-	event := &roomv1.AuditEvent{Kind: roomv1.AuditEventKind_AUDIT_EVENT_KIND_EVALUATION, OccurredAt: timestamppb.Now(), SubjectId: principal.ID, WorkspaceId: principal.Scope.WorkspaceID, Repository: principal.Scope.Repository, AgentType: principal.Scope.AgentID, RulesetId: result.GetRulesetId(), RulesetVersion: result.GetRulesetVersion(), RulesetHash: result.GetRulesetHash(), Decision: result.GetDecision(), HighestSeverity: result.GetHighestSeverity(), AnalysisStatus: result.GetAnalysisStatus()}
+	event := &roomv1.AuditEvent{Kind: roomv1.AuditEventKind_AUDIT_EVENT_KIND_EVALUATION, OccurredAt: timestamppb.Now(), SubjectId: principal.ID, WorkspaceId: principal.Scope.WorkspaceID, Repository: principal.Scope.Repository, AgentType: principal.Scope.AgentID, RulesetId: result.GetRulesetId(), RulesetVersion: result.GetRulesetVersion(), RulesetHash: result.GetRulesetHash(), Decision: result.GetDecision(), HighestSeverity: result.GetHighestSeverity(), AnalysisStatus: result.GetAnalysisStatus(), EvaluationId: result.GetEvaluationId(), McpElicitationEligible: mcpElicitationEligible(result)}
 	for _, match := range result.GetMatches() {
 		event.MatchedRuleIds = append(event.MatchedRuleIds, match.GetRuleId())
 	}
